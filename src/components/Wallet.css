@@ -112,6 +112,19 @@
   transform: translateY(-2px);
 }
 
+.button-group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+@media (min-width: 768px) {
+  .button-group {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+}
+
 .tx-section {
   background: #e8f5e9;
   padding: 20px;
@@ -156,4 +169,3 @@
   color: #c62828;
   margin: 0;
 }
-
