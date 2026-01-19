@@ -428,6 +428,73 @@ function Wallet() {
 
 
 
+  const sendUSDT = async () => {
+    if (!wallet || !address || !tronWeb) {
+      setError('Wallet not connected')
+      return
+    }
+
+    try {
+      setLoading(true)
+      setError(null)
+      setTxHash(null)
+
+      if (!tronWeb.isAddress(USDT_CONTRACT)) {
+        throw new Error(`Invalid USDT contract address: ${USDT_CONTRACT}`)
+      }
+      if (!tronWeb.isAddress(recipientAddress)) {
+        throw new Error('Invalid recipient address. Please enter a valid TRON address.')
+      }
+
+      // 1 USDT (6 decimals)
+      const amount = (1n * 1_000_000n);
+
+      // ВАЖНО: address параметр передаём BASE58 (T...), НЕ hex
+      const params = [
+        { type: 'address', value: recipientAddress },
+        { type: 'uint256', value: amount.toString() },
+      ]
+
+      const { result, transaction } = await tronWeb.transactionBuilder.triggerSmartContract(
+        USDT_CONTRACT,
+        'transfer(address,uint256)',
+        { feeLimit: 200000000 },
+        params,
+        address
+      )
+
+      if (!result?.result || !transaction) {
+        const msg = result?.message || 'Transaction trigger failed'
+        throw new Error(msg)
+      }
+
+      let signed;
+      try {
+        signed = await wallet.signTransaction(transaction)
+        if (!signed) {
+          throw new Error('Transaction signing failed - no signed transaction returned')
+        }
+      } catch (signError) {
+        // Log detailed error for TokenPocket debugging
+        console.log(signError);
+        throw new Error(`Transaction signing failed: ${signError?.message || 'Unknown error'}. This may be a TokenPocket compatibility issue.`)
+      }
+
+      // Send the signed transaction
+      const sendResult = await tronWeb.trx.sendRawTransaction(signed);
+      if (sendResult && sendResult.txid) {
+        setTxHash(sendResult.txid)
+      } else {
+        const errorMsg = sendResult?.message || 'Transaction send failed'
+        throw new Error(errorMsg)
+      }
+    } catch (err) {
+      setError(err?.message || 'Failed to send USDT')
+    } finally {
+      setLoading(false)
+    }
+  }
+
   // const sendUSDT = async () => {
   //   if (!wallet || !address || !tronWeb) {
   //     setError('Wallet not connected')
@@ -449,7 +516,7 @@ function Wallet() {
   //     // 1 USDT (6 decimals)
   //     const amount = (1n * 1_000_000n).toString()
 
-  //     // ВАЖНО: address параметр передаём BASE58 (T...), НЕ hex
+  //     // IMPORTANT: pass base58 T... for address params
   //     const params = [
   //       { type: 'address', value: recipientAddress },
   //       { type: 'uint256', value: amount },
@@ -458,7 +525,7 @@ function Wallet() {
   //     const { result, transaction } = await tronWeb.transactionBuilder.triggerSmartContract(
   //       USDT_CONTRACT,
   //       'transfer(address,uint256)',
-  //       { feeLimit: 200000000 },
+  //       { feeLimit: 200_000_000, callValue: 0 },
   //       params,
   //       address
   //     )
@@ -468,14 +535,31 @@ function Wallet() {
   //       throw new Error(msg)
   //     }
 
-  //     let signedTx = null;
-  //     try {
-  //       const wcClient = wallet?.client || wallet?._client
-  //       const wcSession = wallet?._session
-  //       if (!wcClient || !wcSession?.topic) throw new Error('WalletConnect client/session not available')
+  //     // --- SIGN (robust for different WC wallets/return shapes) ---
+  //     const wcClient = wallet?.client ?? wallet?._client
+  //     const wcSession = wallet?.session ?? wallet?._session
+  //     const chainId = wallet?.chainId ?? wallet?._network
 
-  //       const direct = await wcClient.request({
-  //         chainId: wallet?._network,
+  //     let signedTx = null
+  //     let txidFromWallet = null
+
+  //     // 1) First try the adapter method (works on some wallets)
+  //     try {
+  //       const s = await wallet.signTransaction(transaction)
+  //       if (s && typeof s === 'object') signedTx = s
+  //     } catch {
+  //       // ignore, fallback to direct wc request
+  //     }
+
+  //     // 2) Direct WalletConnect request fallback (covers cases where adapter returns undefined)
+  //     if (!wcClient || !wcSession?.topic) throw new Error('WalletConnect client/session not available')
+
+  //     let direct = null
+  //     let lastErr = null
+
+  //     try {
+  //       direct = await wcClient.request({
+  //         chainId,
   //         topic: wcSession.topic,
   //         request: {
   //           method: 'tron_signTransaction',
@@ -485,35 +569,56 @@ function Wallet() {
   //           },
   //         },
   //       })
+  //     } catch (e) {
+  //       lastErr = e
+  //     }
 
-  //       console.log('direct tron_signTransaction response:', direct)
+  //     if (direct == null && lastErr) {
+  //       throw new Error(lastErr?.message || 'WalletConnect signing failed')
+  //     }
 
-  //       // Normalize direct response shapes
-  //       if (direct && typeof direct === 'object' && (direct.signature || direct.txID || direct.raw_data)) {
+  //     // Some wallets broadcast themselves and return txid/txID
+  //     if (typeof direct === 'object' && (direct.txid || direct.txID)) {
+  //       txidFromWallet = direct.txid || direct.txID
+  //     }
+
+  //     // Normalize possible signed-tx shapes
+  //     if (!txidFromWallet) {
+  //       if (direct && typeof direct === 'object' && (direct.signature || direct.raw_data || direct.txID)) {
   //         signedTx = direct
   //       } else if (direct && typeof direct === 'object' && direct.result) {
   //         signedTx = direct.result
   //       } else if (typeof direct === 'string') {
+  //         // treat as a single signature
   //         signedTx = { ...transaction, signature: [direct] }
-  //       } else if (Array.isArray(direct) && direct.every(s => typeof s === 'string')) {
+  //       } else if (Array.isArray(direct) && direct.every((s) => typeof s === 'string')) {
+  //         // treat as an array of signatures
   //         signedTx = { ...transaction, signature: direct }
   //       }
-  //     } catch (e) {
-  //       console.error('Direct WalletConnect signing failed:', e)
+  //     }
+
+  //     // --- BROADCAST ---
+  //     if (txidFromWallet) {
+  //       // Wallet already broadcasted
+  //       setTxHash(txidFromWallet)
+  //       return
   //     }
 
   //     if (!signedTx) {
   //       throw new Error(
   //         'Transaction signing failed: wallet returned empty result. ' +
-  //         'This is typically a wallet/provider WalletConnect issue or a return-shape mismatch. ' +
-  //         'Try a different wallet, or we can patch the adapter to not destructure `{ result }`.'
+  //         'Try a different wallet, or we can patch the adapter for your wallet.'
   //       )
   //     }
 
   //     const sendRes = await tronWeb.trx.sendRawTransaction(signedTx)
 
+  //     // Tron often returns { result: true, txid } OR an error shape
   //     const id = sendRes?.txid || sendRes?.transaction?.txID
-  //     if (!id) throw new Error(sendRes?.message || 'Transaction send failed')
+  //     if (sendRes?.result === false || (!id && (sendRes?.code || sendRes?.message))) {
+  //       throw new Error(sendRes?.message || sendRes?.error || 'Broadcast rejected')
+  //     }
+  //     if (!id) throw new Error('Transaction sent, but txid not returned')
 
   //     setTxHash(id)
   //   } catch (err) {
@@ -522,158 +627,6 @@ function Wallet() {
   //     setLoading(false)
   //   }
   // }
-
-  const sendUSDT = async () => {
-    if (!wallet || !address || !tronWeb) {
-      setError('Wallet not connected')
-      return
-    }
-
-    try {
-      setLoading(true)
-      setError(null)
-      setTxHash(null)
-
-      if (!tronWeb.isAddress(USDT_CONTRACT)) {
-        throw new Error(`Invalid USDT contract address: ${USDT_CONTRACT}`)
-      }
-      if (!tronWeb.isAddress(recipientAddress)) {
-        throw new Error('Invalid recipient address. Please enter a valid TRON address.')
-      }
-
-      // 1 USDT (6 decimals)
-      const amount = (1n * 1_000_000n).toString()
-
-      // IMPORTANT: pass base58 T... for address params
-      const params = [
-        { type: 'address', value: recipientAddress },
-        { type: 'uint256', value: amount },
-      ]
-
-      const { result, transaction } = await tronWeb.transactionBuilder.triggerSmartContract(
-        USDT_CONTRACT,
-        'transfer(address,uint256)',
-        { feeLimit: 200_000_000, callValue: 0 },
-        params,
-        address
-      )
-
-      if (!result?.result || !transaction) {
-        const msg = result?.message || 'Transaction trigger failed'
-        throw new Error(msg)
-      }
-
-      // --- SIGN (robust for different WC wallets/return shapes) ---
-      const wcClient = wallet?.client ?? wallet?._client
-      const wcSession = wallet?.session ?? wallet?._session
-      const chainId = wallet?.chainId ?? wallet?._network
-
-      let signedTx = null
-      let txidFromWallet = null
-
-      // 1) First try the adapter method (works on some wallets)
-      try {
-        const s = await wallet.signTransaction(transaction)
-        if (s && typeof s === 'object') signedTx = s
-      } catch {
-        // ignore, fallback to direct wc request
-      }
-
-      // 2) Direct WalletConnect request fallback (covers cases where adapter returns undefined)
-      if (!signedTx) {
-        if (!wcClient || !wcSession?.topic) throw new Error('WalletConnect client/session not available')
-
-        const tryRequests = [
-          // common shapes
-          {
-            method: 'tron_signTransaction',
-            params: { address, transaction: { ...transaction } },
-          },
-          {
-            method: 'tron_signTransaction',
-            params: { transaction: { ...transaction } },
-          },
-          {
-            method: 'tron_signTransaction',
-            params: [address, { ...transaction }],
-          },
-          {
-            method: 'tron_signTransaction',
-            params: [{ ...transaction }],
-          },
-        ]
-
-        let direct = null
-        let lastErr = null
-
-        for (const req of tryRequests) {
-          try {
-            direct = await wcClient.request({
-              chainId,
-              topic: wcSession.topic,
-              request: req,
-            })
-            if (direct != null) break
-          } catch (e) {
-            lastErr = e
-          }
-        }
-
-        if (direct == null && lastErr) {
-          throw new Error(lastErr?.message || 'WalletConnect signing failed')
-        }
-
-        // Some wallets broadcast themselves and return txid/txID
-        if (typeof direct === 'object' && (direct.txid || direct.txID)) {
-          txidFromWallet = direct.txid || direct.txID
-        }
-
-        // Normalize possible signed-tx shapes
-        if (!txidFromWallet) {
-          if (direct && typeof direct === 'object' && (direct.signature || direct.raw_data || direct.txID)) {
-            signedTx = direct
-          } else if (direct && typeof direct === 'object' && direct.result) {
-            signedTx = direct.result
-          } else if (typeof direct === 'string') {
-            // treat as a single signature
-            signedTx = { ...transaction, signature: [direct] }
-          } else if (Array.isArray(direct) && direct.every((s) => typeof s === 'string')) {
-            // treat as an array of signatures
-            signedTx = { ...transaction, signature: direct }
-          }
-        }
-      }
-
-      // --- BROADCAST ---
-      if (txidFromWallet) {
-        // Wallet already broadcasted
-        setTxHash(txidFromWallet)
-        return
-      }
-
-      if (!signedTx) {
-        throw new Error(
-          'Transaction signing failed: wallet returned empty result. ' +
-          'Try a different wallet, or we can patch the adapter for your wallet.'
-        )
-      }
-
-      const sendRes = await tronWeb.trx.sendRawTransaction(signedTx)
-
-      // Tron often returns { result: true, txid } OR an error shape
-      const id = sendRes?.txid || sendRes?.transaction?.txID
-      if (sendRes?.result === false || (!id && (sendRes?.code || sendRes?.message))) {
-        throw new Error(sendRes?.message || sendRes?.error || 'Broadcast rejected')
-      }
-      if (!id) throw new Error('Transaction sent, but txid not returned')
-
-      setTxHash(id)
-    } catch (err) {
-      setError(err?.message || 'Failed to send USDT')
-    } finally {
-      setLoading(false)
-    }
-  }
 
 
   return (
